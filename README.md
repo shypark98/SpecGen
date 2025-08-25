@@ -598,7 +598,7 @@ Simply run the following script:
 ./test/regression
 ```
 
-# Artificial Netlist Generator (ArtNet) Spec File Generatin Flow
+# ArtNet Spec File Generation Flow
 
 ArtNet, hierarchical clustering-based artificial netlist generator, enables netlist generation from parameters of a given target design. 
 
