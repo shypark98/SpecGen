@@ -39,7 +39,9 @@ class Logger;
 namespace par {
 
 class Cluster;
-class ClusterTree;
+using SharedClusterVector = std::vector<std::shared_ptr<Cluster>>;
+class ModuleMgr;
+class TritonPart;
 
 struct CompareInstancePtr
 {
@@ -253,7 +255,7 @@ class PartitionMgr
   std::tuple<double, double, double> fitRent(double* x, 
                                      double* y, 
                                      int n);
-  void linCurvFit(ClusterTree& tree,
+  void linCurvFit(ModuleMgr& tree,
                   float& Rratio,
                   float& p,
                   float& q);
@@ -265,24 +267,15 @@ class PartitionMgr
                double *c1,
                double *cov_11,
                double *sumsq);
-  float computeMicronArea(odb::dbInst* inst);
   bool isIgnoredInst(odb::dbInst* inst);
-  std::pair<Cluster*, Cluster*>
-  partitionCluster(Cluster* parent, 
-                   ClusterTree& tree);
-  void getClusterIONum(Cluster* parent,
-                       double &sumT,
-                       double &inT,
-                       double &outT);
-  sta::Instance* buildSubInst(const char* name,
-                         const char* port_prefix,
-                         sta::Library* library,
-                         sta::NetworkReader* network,
-                         sta::Instance* parent,
-                         const std::set<sta::Instance*>* insts,
-                         std::map<sta::Net*, sta::Port*>* port_map);
-  bool partitionerSolutionIsFullyUnbalanced(const std::vector<int>& solution,
-                                            const int num_other_cluster_vertices);
+  bool partitionCluster(std::shared_ptr<TritonPart> triton_part,
+                        ModuleMgr& modMgr,
+                        SharedClusterVector& cv);
+  int getClusterIONum(std::vector<bool>& inside, 
+                      std::shared_ptr<Cluster> cluster);
+  void Partitioning(std::shared_ptr<TritonPart> triton_part,
+                    std::shared_ptr<Cluster> cluster,
+                    SharedClusterVector& resultCV);
   void writeFile(std::unordered_map<std::string, std::pair<int, bool>>& onlyUseMasters,
                  std::string& top_name,
                  int& numInsts,
@@ -309,7 +302,7 @@ class PartitionMgr
 
   sta::Instance* buildPartitionedTopInstance(const char* name,
                                              sta::Library* library,
-                                             sta::NetworkReader* network);
+                                             sta::NetworkReader* network); 
   odb::dbDatabase* db_ = nullptr;
   sta::dbNetwork* db_network_ = nullptr;
   sta::dbSta* sta_ = nullptr;

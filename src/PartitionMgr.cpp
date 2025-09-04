@@ -425,6 +425,31 @@ std::vector<int> PartitionMgr::PartitionKWaySimpleMode(
 {
   auto triton_part
       = std::make_unique<TritonPart>(db_network_, db_, sta_, logger_);
+    
+  /*
+    triton_part->SetFineTuneParams(  // coarsening related parameters
+      200, // thr_coarsen_hyperedge_size_skip (default: 200)
+      10, // thr_coarsen_vertices (default: 10)
+      50, // thr_coarsen_hyperedges (default: 50)
+      1.6, // coarsening_ratio (default: 1.6)
+      30, // max_coarsen_iters (default: 30)
+      0.0001, // adj_diff_ratio (default: 0.0001)
+      4, // min_num_vertices_each_part (default: 4)
+      // initial partitioning related parameters
+      15, // num_initial_solutions(default: 50)
+      3, // num_best_initial_solutions (default: 10)
+      // refinement related parameters
+      7, // refiner_iters (default: 10)
+      50, // max_moves (default: 60)
+      0.5, // early_stop_ratio (default: 0.5)
+      25, // total_corking_passes (default: 25)
+      // vcycle related parameters
+      true, //v_cycle_flag (default: true)
+      1, // max_num_vcycle (default: 1)
+      3, // num_coarsen_solutions (default: 3)
+      0, // num_vertices_threshold_ilp (default: 50)
+      1000); //global_net_threshold (default: 1000)
+  */
   return triton_part->PartitionKWaySimpleMode(num_parts_arg,
                                               balance_constraint_arg,
                                               seed_arg,

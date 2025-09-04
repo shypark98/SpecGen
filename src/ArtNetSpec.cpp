@@ -15,7 +15,9 @@
 #include <string>
 #include <vector>
 #include <unordered_set>
+#include <unordered_map>
 #include <omp.h>
+#include <chrono>
 
 #include "TritonPart.h"
 #include "ArtNetSpec.h"
@@ -83,78 +85,20 @@ namespace par {
 
 int Cluster::next_id_ = 0;
 
-// find the correct brackets used in the liberty libraries.
-static void determineLibraryBrackets(const dbNetwork* db_network,
-                                     char* left,
-                                     char* right)
+void printMemoryUsage()
 {
-  *left = '[';
-  *right = ']';
-
-  sta::LibertyLibraryIterator* lib_iter = db_network->libertyLibraryIterator();
-  while (lib_iter->hasNext()) {
-    const sta::LibertyLibrary* lib = lib_iter->next();
-    *left = lib->busBrktLeft();
-    *right = lib->busBrktRight();
-  }
-  delete lib_iter;
-}
-
-// determine the required direction of a port.
-static PortDirection* determinePortDirection(const Net* net,
-                                             const std::set<Instance*>* insts,
-                                             const dbNetwork* db_network)
-{
-  bool local_only = true;
-  bool locally_driven = false;
-  bool externally_driven = false;
-
-  NetTermIterator* term_iter = db_network->termIterator(net);
-  while (term_iter->hasNext()) {
-    Term* term = term_iter->next();
-    PortDirection* dir = db_network->direction(db_network->pin(term));
-    if (dir->isAnyInput()) {
-      externally_driven = true;
-    }
-    local_only = false;
-  }
-  delete term_iter;
-
-  if (insts != nullptr) {
-    NetPinIterator* pin_iter = db_network->pinIterator(net);
-    while (pin_iter->hasNext()) {
-      const Pin* pin = pin_iter->next();
-      const PortDirection* dir = db_network->direction(pin);
-      Instance* inst = db_network->instance(pin);
-
-      if (insts->find(inst) == insts->end()) {
-        local_only = false;
-        if (dir->isAnyOutput()) {
-          externally_driven = true;
+    std::ifstream status_file("/proc/self/status");
+    std::string line;
+    long vm_hwm_kb = 0;
+    while (std::getline(status_file, line))
+    {
+        if (line.substr(0, 6) == "VmHWM:")
+        {
+            sscanf(line.c_str(), "VmHWM: %ld kB", &vm_hwm_kb);
+            break;
         }
-      } else {
-        if (dir->isAnyOutput()) {
-          locally_driven = true;
-        }
-      }
     }
-    delete pin_iter;
-  }
-
-  // no port is needed
-  if (local_only) {
-    return nullptr;
-  }
-
-  if (locally_driven && externally_driven) {
-    return PortDirection::bidirect();
-  }
-
-  if (externally_driven) {
-    return PortDirection::input();
-  }
-
-  return PortDirection::output();
+    std::cout << "Peak memory usage (HWM): " << vm_hwm_kb / 1024.0 << " MB" << std::endl;
 }
 
 void PartitionMgr::writeArtNetSpec(const char* fileName) {
@@ -354,8 +298,12 @@ void PartitionMgr::BuildTimingPath(int& Dmax,
 void PartitionMgr::getFromPAR(float& Rratio,
                               float& p,
                               float& q) 
-{
+{   
+    auto start = std::chrono::steady_clock::now();
     getRents(Rratio, p, q);
+    auto end = std::chrono::steady_clock::now();
+    std::chrono::duration<double> elapsed_seconds = end - start;
+    std::cout << "getRents() : " << elapsed_seconds.count() << std::endl;
 }
 
 void PartitionMgr::getRents(float& Rratio,
@@ -363,289 +311,240 @@ void PartitionMgr::getRents(float& Rratio,
                             float& q)
 {
     auto block = getDbBlock();
-    auto tree = ClusterTree(block); 
-    if (!tree.getRoot()) {
-        Rratio = 0.0f;
-        p = 0.0f;
-        q = 0.0f;
-        return;
-    }
-
-    std::vector<Cluster*> current_level_clusters;
-    current_level_clusters.push_back(tree.getRoot());
-    
+    ModuleMgr modMgr;
+    SharedClusterVector cv;
+    auto c = std::make_shared<Cluster>(0);
+    cv.push_back(c);
+    auto triton_part = std::make_shared<TritonPart>(db_network_, db_, sta_, logger_);
     double totPins = 0;
+    int id = 0;
     for (dbInst* inst : block->getInsts()) {
         for (dbITerm* inst_iterm : inst->getITerms()) {
             if(inst_iterm->getIoType() == dbIoType::INPUT ||
                inst_iterm->getIoType() == dbIoType::OUTPUT)
                 totPins++;
         }
+        c->addInst(inst);
+        odb::dbIntProperty::create(inst, "inst_id", id);
+        ++id;
     }
+
     double avgK = totPins / block->getInsts().size(); 
-    
-    double numPIs = 0, numPOs = 0;
-    auto bterms = block->getBTerms();
-    for(auto bterm_itr = bterms.begin(); bterm_itr != bterms.end(); ++bterm_itr) {
-        dbBTerm* bterm = *bterm_itr;
-        if(bterm->getIoType() == odb::dbIoType::INPUT)
-            numPIs++;
-        if(bterm->getIoType() == odb::dbIoType::OUTPUT)
-            numPOs++;
+    bool flag = true;
+    while (flag) {
+        printMemoryUsage();
+        flag = partitionCluster(triton_part, modMgr, cv); 
     }
-    
-    auto m = std::make_shared<Module>(tree.getNumModules());
-    m->setAvgK(avgK);
-    m->setAvgInsts(block->getInsts().size());
-    m->setAvgT(block->getBTerms().size());
-    m->setInT(numPIs);
-    m->setOutT(numPOs);
-    m->setSigmaT(0.0);
-    tree.addModule(m);
-    
-    int level = 0;
-    while (true) {
-        bool earlyStop = false;
-        std::vector<Cluster*> next_level_clusters;
-        std::cout << "start partitioning level " << level << std::endl; 
-        #pragma omp parallel for shared(current_level_clusters, next_level_clusters, earlyStop)
-        for (Cluster* current_cluster : current_level_clusters) {
-            auto [child_0, child_1] = partitionCluster(current_cluster, tree);
-            
-            if (child_1 != nullptr) {
-                #pragma omp critical
-                {
-                    next_level_clusters.push_back(child_0);
-                    next_level_clusters.push_back(child_1);
-                }
-            } else { // child_1 == nullptr
-                #pragma omp atomic
-                earlyStop = true;
-            }
-            if (earlyStop)
-                break;
-        }
-        //if (!earlyStop) {
-            current_level_clusters = next_level_clusters;
-            int sampleNum = current_level_clusters.size(); 
-            std::vector<double> numInsts_vec, sumT_vec, inT_vec, outT_vec;
-        
-            for (auto cluster : current_level_clusters) {
-                double sumT = 0, inT = 0, outT = 0; 
-                getClusterIONum(cluster, sumT, inT, outT);
-                numInsts_vec.push_back(cluster->getNumInsts());
-                sumT_vec.push_back(sumT);
-                inT_vec.push_back(inT);
-                outT_vec.push_back(outT);
-            }
-            
-            double total_insts = std::accumulate(numInsts_vec.begin(), numInsts_vec.end(), 0.0);
-            double total_sumT = std::accumulate(sumT_vec.begin(), sumT_vec.end(), 0.0);
-            double total_inT = std::accumulate(inT_vec.begin(), inT_vec.end(), 0.0);
-            double total_outT = std::accumulate(outT_vec.begin(), outT_vec.end(), 0.0);
-        
-            double avgInsts = total_insts / sampleNum;
-            double avgT = total_sumT / sampleNum;
-            double avgInT = total_inT / sampleNum;
-            double avgOutT = total_outT / sampleNum;
-            
-            double varT = 0.0;
-            if (sampleNum > 1) {
-                double sqdiffs = 0.0;
-                for (double val : sumT_vec) {
-                    sqdiffs += (val - avgT) * (val - avgT);
-                }
-                varT = sqdiffs / (sampleNum - 1);
-            }
-            double stdevT = sqrt(varT);
-        
-        
-            if (avgInsts >= 1 && avgT >= 1) {
-                // in this situation, module means partition level
-                auto m = std::make_shared<Module>(tree.getNumModules());
-                m->setAvgInsts(avgInsts);
-                m->setAvgT(avgT);
-                m->setInT(avgInT);
-                m->setOutT(avgOutT);
-                m->setSigmaT(stdevT);
-                tree.addModule(m);
-            }
-        //}
-        if (earlyStop) {
-            break;
-        }
-        level++;
+
+    if (block->getInsts().size() >= 1 && block->getBTerms().size() >= 1) {
+        auto m = std::make_shared<Module>(modMgr.getNumModules());
+        m->setAvgK(avgK);
+        m->setAvgInsts(block->getInsts().size());
+        m->setAvgT(block->getBTerms().size());
+        m->setSigmaT(0.0);
+        modMgr.addModule(m);
+        linCurvFit(modMgr, Rratio, p, q);
     }
-    linCurvFit(tree, Rratio, p, q);
 }
 
-std::pair<Cluster*, Cluster*>
-PartitionMgr::partitionCluster(Cluster* parent,
-                               ClusterTree& tree) 
+bool
+PartitionMgr::partitionCluster(std::shared_ptr<TritonPart> triton_part,
+                               ModuleMgr& modMgr, 
+                               SharedClusterVector& cv)
 {   
-    // Recursion termination condition 
-    if (parent->getLeafInsts().size() <= 5) {
-        std::cout << "Cluster '" << parent->getName() << "' is small enough ("
-                  << parent->getLeafInsts().size() << " insts). Stopping recursion.\n";
+    int MIN_GATE_NUM_PER_CLUSTER = 100;
+    bool flag = true;
+    SharedClusterVector resultCV;
+    int clusterNum = cv.size();
+    double sampleNum = (double)clusterNum * 2.0;
+    double expo = 1.0 / sampleNum;
+    double avgInsts = 0;
+    double avgT = 0;
+    int count = 0;
+    std::vector<double> Tvect;
+    std::vector<bool> inside;
+    int numInsts = getDbBlock()->getInsts().size(); 
+    
+    for (int i = 0; i < clusterNum; ++i)
+    {
+        auto c = cv[i];
+        resultCV.clear();
+        Partitioning(triton_part, c, resultCV);
+        cv.push_back(resultCV[0]);
+        cv.push_back(resultCV[1]);
 
-        return {parent, nullptr};
+        for (int j = 0; j < 2; ++j)
+        {
+            auto newC = resultCV[j];
+            int newGateNum = newC->getNumInsts();
+            if (newGateNum < MIN_GATE_NUM_PER_CLUSTER) {
+                flag = false;
+            }
+            
+            inside.assign(numInsts, false);
+            for (int k = 0; k < newGateNum; ++k) {
+                auto inst = newC->getInst(k);
+                auto inst_prop = odb::dbIntProperty::find(inst, "inst_id");
+                const int inst_id = inst_prop->getValue(); 
+                inside[inst_id] = true;
+            }
+
+            double sumT = getClusterIONum(inside, newC);
+            double numInsts = newC->getNumInsts();
+            if (numInsts >= 1.0 && sumT >= 1.0)
+            {
+                avgInsts += numInsts * expo; 
+                avgT += sumT * expo;
+                Tvect.push_back(sumT);
+                count++;
+            }
+        }
     }
     
-    auto block = getDbBlock();
-    std::map<int, int> cluster_vertex_id_map;
+    double stdevT = 0.0;
+
+    if (Tvect.size() > 1) {
+        double sumSqrtT = 0.0;
+        for (auto itr = Tvect.begin(); itr != Tvect.end(); ++itr) {
+            double t = *itr;
+            sumSqrtT += pow((t - avgT), 2);
+        }
+        stdevT = sqrt(double(sumSqrtT) / count);
+    }
+
+    if (avgInsts >= 1 && avgT >= 1)
+    {
+        auto m = std::make_shared<Module>(modMgr.getNumModules());
+        m->setAvgInsts(avgInsts);
+        m->setAvgT(avgT);
+        m->setSigmaT(stdevT);
+        modMgr.addModule(m);
+        std::cout << "avgInsts: " << avgInsts << " avgT: " << avgT << std::endl;
+    }
+    
+    // erase the first clusterNum elements
+    cv.erase(cv.begin(), cv.begin() + clusterNum);
+
+    return flag;
+}
+
+void
+PartitionMgr::Partitioning(std::shared_ptr<TritonPart> triton_part,
+                           std::shared_ptr<Cluster> cluster, 
+                           SharedClusterVector& resultCV)
+{
+    std::vector<odb::dbInst*> insts;
+    insts.reserve(cluster->getNumInsts());
+    std::map<odb::dbInst*, int> inst_vertex_id_map;
     std::vector<float> vertex_weight;
     int vertex_id = 0;
-
-    // Register external clusters as vertices
-    for (auto& [cluster_id, cluster] : tree.maps.id_to_cluster) {
-        cluster_vertex_id_map[cluster_id] = vertex_id++;
-        vertex_weight.push_back(0.0f);
-    }
-    const int num_other_cluster_vertices = vertex_id;
-
-    std::vector<odb::dbInst*> insts;
-    std::map<odb::dbInst*, int> inst_vertex_id_map;
+    int large_net_threshold = 50; 
+    std::vector<bool> inside;
+    inside.assign(getDbBlock()->getInsts().size(), false);
+    std::unordered_set<odb::dbNet*> cluster_nets;
     
-    for (auto& std_cell : parent->getLeafInsts()) {
-        inst_vertex_id_map[std_cell] = vertex_id++;
-        vertex_weight.push_back(computeMicronArea(std_cell));
-        insts.push_back(std_cell);
+    const int num_insts = cluster->getNumInsts();
+    insts.reserve(num_insts);
+    vertex_weight.reserve(num_insts);
+    cluster_nets.reserve(num_insts);
+
+    for (odb::dbInst* inst : cluster->getInsts()) {
+        inst_vertex_id_map[inst] = vertex_id++;
+        vertex_weight.push_back(1.0f);
+        auto inst_prop = odb::dbIntProperty::find(inst, "inst_id");
+        const int inst_id = inst_prop->getValue();
+        inside[inst_id] = true;
+        insts.push_back(inst);
+
+        for (odb::dbITerm* iterm : inst->getITerms()) {
+            odb::dbNet* net = iterm->getNet();
+            if (net != nullptr && !net->getSigType().isSupply()) {
+                cluster_nets.insert(net);
+            }
+        }
     }
 
     std::vector<std::vector<int>> hyperedges;
-    for (odb::dbNet* net : block->getNets()) {
-        if (net->getSigType().isSupply()) {
-            continue;
-        }
-
+    hyperedges.reserve(cluster_nets.size());
+    for (odb::dbNet* net : cluster_nets) {
         int driver_id = -1;
         std::set<int> loads_id;
-        bool ignore = false;
         for (odb::dbITerm* iterm : net->getITerms()) {
             odb::dbInst* inst = iterm->getInst();
-            if (isIgnoredInst(inst)) {
-                ignore = true;
-                break;
-            }
-
-            const int cluster_id = tree.maps.inst_to_cluster_id.at(inst);
-            int vertex_id = (cluster_id != parent->getId())
-                            ? cluster_vertex_id_map[cluster_id]
-                            : inst_vertex_id_map[inst];
-            if (iterm->getIoType() == odb::dbIoType::OUTPUT) {
-                driver_id = vertex_id;
-            } else {
-                loads_id.insert(vertex_id);
-            }
-        }
-
-        if (ignore) {
-            continue;
-        }
-
-        for (odb::dbBTerm* bterm : net->getBTerms()) {
-            const int cluster_id = tree.maps.bterm_to_cluster_id.at(bterm);
-            if (bterm->getIoType() == odb::dbIoType::INPUT) {
-                driver_id = cluster_vertex_id_map[cluster_id];
-            } else {
-                loads_id.insert(cluster_vertex_id_map[cluster_id]);
+            auto inst_prop = odb::dbIntProperty::find(inst, "inst_id");
+            const int inst_id = inst_prop->getValue();
+            if (inside[inst_id]) {
+                int vertex_id = inst_vertex_id_map[inst];
+                if (iterm->getIoType() == odb::dbIoType::OUTPUT) {
+                    driver_id = vertex_id;
+                } else {
+                    loads_id.insert(vertex_id);
+                }
             }
         }
         loads_id.insert(driver_id);
         if (driver_id != -1 && loads_id.size() > 1
-            && loads_id.size() < tree.large_net_threshold) {
+            && loads_id.size() < large_net_threshold) {
             std::vector<int> hyperedge;
             hyperedge.insert(hyperedge.end(), loads_id.begin(), loads_id.end());
             hyperedges.push_back(hyperedge);
         }
     }
+
     const int seed = 0;
-    constexpr float default_balance_constraint = 1.0f;
+    constexpr float default_balance_constraint = 0.5f;
     float balance_constraint = default_balance_constraint;
     const int num_parts = 2;  // We use two-way partitioning here
     const int num_vertices = static_cast<int>(vertex_weight.size());
     std::vector<float> hyperedge_weights(hyperedges.size(), 1.0f);
-    
-    // Due to the discrepancy that may exist between the weight of vertices
-    // that represent macros/std cells, the partitioner may fail to meet the
-    // balance constraint. This may cause the output to be completely unbalanced
-    // and lead to infinite partitioning recursion. To handle that, we relax
-    // the constraint until we find a reasonable split.
-    constexpr float balance_constraint_relaxation_factor = 10.0f;
+
     std::vector<int> solution;
-    do {
-        if (balance_constraint >= 90) {
-            std::cout << "Cannot find a balanced partitioning for the clusters." << std::endl;
-        }
+    triton_part->SetFineTuneParams(  // coarsening related parameters
+      200, // thr_coarsen_hyperedge_size_skip (default: 200)
+      10, // thr_coarsen_vertices (default: 10)
+      50, // thr_coarsen_hyperedges (default: 50)
+      1.6, // coarsening_ratio (default: 1.6)
+      30, // max_coarsen_iters (default: 30)
+      0.0001, // adj_diff_ratio (default: 0.0001)
+      4, // min_num_vertices_each_part (default: 4)
+      // initial partitioning related parameters
+      15, // num_initial_solutions(default: 50)
+      3, // num_best_initial_solutions (default: 10)
+      // refinement related parameters
+      7, // refiner_iters (default: 10)
+      50, // max_moves (default: 60)
+      0.5, // early_stop_ratio (default: 0.5)
+      25, // total_corking_passes (default: 25)
+      // vcycle related parameters
+      true, //v_cycle_flag (default: true)
+      1, // max_num_vcycle (default: 1)
+      3, // num_coarsen_solutions (default: 3)
+      0, // num_vertices_threshold_ilp (default: 50)
+      1000); //global_net_threshold (default: 1000)
 
-        solution = PartitionKWaySimpleMode(num_parts,
-                                           balance_constraint,
-                                           seed,
-                                           hyperedges,
-                                           vertex_weight,
-                                           hyperedge_weights);
+    solution = triton_part->PartitionKWaySimpleMode(num_parts,
+                                                    balance_constraint,
+                                                    seed,
+                                                    hyperedges,
+                                                    vertex_weight,
+                                                    hyperedge_weights);
 
-        balance_constraint += balance_constraint_relaxation_factor;
-    } while (partitionerSolutionIsFullyUnbalanced(solution, 
-                                                  num_other_cluster_vertices));
-    
-    parent->clearLeafInsts();
+    cluster->clearInsts();
+    auto cluster_part_1 = std::make_shared<Cluster>(0);
 
-    const std::string cluster_name = parent->getName();
-    parent->setName(cluster_name + std::string("_0"));
-    auto cluster_part_1 = std::make_unique<Cluster>(
-            cluster_name + std::string("_1"));
-
-    for (int i = num_other_cluster_vertices; i < num_vertices; i++) {
-        odb::dbInst* inst = insts[i - num_other_cluster_vertices];
+    for (int i = 0; i < num_vertices; i++) {
+        odb::dbInst* inst = insts[i];
         if (solution[i] == 0) {
-            parent->addLeafInst(inst);
+            cluster->addInst(inst);
         } else {
-            cluster_part_1->addLeafInst(inst);
+            cluster_part_1->addInst(inst);
         }
     }
-
-    Cluster* raw_part_1 = cluster_part_1.get();
-    cluster_part_1->setParent(parent);
-    parent->addChild(std::move(cluster_part_1));
-    tree.registerCluster(raw_part_1);
-    // Recursive break the cluster
-    // until the size of the cluster is less than max_num_inst_
-    return {parent, raw_part_1};
+    
+    resultCV.push_back(cluster_part_1);
+    resultCV.push_back(cluster);
 }
-
-bool PartitionMgr::partitionerSolutionIsFullyUnbalanced(
-    const std::vector<int>& solution,
-    const int num_other_cluster_vertices)
-{
-  // The partition of the first vertex which represents
-  // an actual macro or std cell.
-  const int first_vertex_partition = solution[num_other_cluster_vertices];
-  const int number_of_vertices = static_cast<int>(solution.size());
-
-  // Skip all the vertices that represent other clusters.
-  for (int vertex_id = num_other_cluster_vertices;
-       vertex_id < number_of_vertices;
-       ++vertex_id) {
-    if (solution[vertex_id] != first_vertex_partition) {
-      return false;
-    }
-  }
-
-  return true;
-}
-
-float PartitionMgr::computeMicronArea(odb::dbInst* inst)
-{
-  auto block = getDbBlock();
-  const float width = static_cast<float>(
-      block->dbuToMicrons(inst->getBBox()->getBox().dx()));
-  const float height = static_cast<float>(
-      block->dbuToMicrons(inst->getBBox()->getBox().dy()));
-
-  return width * height;
-}
-
+    
 bool PartitionMgr::isIgnoredInst(odb::dbInst* inst)
 {
   odb::dbMaster* master = inst->getMaster();
@@ -654,273 +553,64 @@ bool PartitionMgr::isIgnoredInst(odb::dbInst* inst)
          || inst->isFixed();
 }
 
-void PartitionMgr::getClusterIONum(Cluster* parent,
-                                   double &sumT,
-                                   double &numPIs,
-                                   double &numPOs) 
-{
+int PartitionMgr::getClusterIONum(std::vector<bool>& inside, 
+                                  std::shared_ptr<Cluster> cluster) {
+   
+    std::vector<odb::dbInst*> cInsts = cluster->getInsts();
+    std::unordered_set<odb::dbNet*> cNets;
 
-    // Build submodule partitions
-    std::map<sta::Net*, sta::Port*> sta_port_map;
-    std::set<Instance*> instance_set;
-    for (odb::dbInst* inst : parent->getLeafInsts())
-        instance_set.insert(db_network_->dbToSta(inst));
+    for (odb::dbInst* inst : cInsts) {
+        for (odb::dbITerm* iterm : inst->getITerms()) {
+            odb::dbNet* net = iterm->getNet();
+            if (!net || net->getSigType() != odb::dbSigType::SIGNAL)
+                continue;
+            cNets.insert(net);
+        }
+    }
 
-    // Build submodule partitions
-    const std::string subModule_name = parent->getName();
+    int terms = 0;
+    for (odb::dbNet* net : cNets) {
+        if (!net) continue;
 
-    // Create new network and library
-    sta::NetworkReader* sub_network = sta::makeConcreteNetwork();
-    sta::Library* sub_library = sub_network->makeLibrary("Partitions", nullptr);
+        if (!net->getBTerms().empty()) {
+            terms++;
+            continue;
+        }
 
-    sta::Instance* sub_inst = buildSubInst(subModule_name.c_str(),
-                                           "sub",
-                                           sub_library,
-                                           sub_network,
-                                           nullptr, // No top instance
-                                           &instance_set,
-                                           &sta_port_map);
+        for (odb::dbITerm* iterm : net->getITerms()) {
+            odb::dbInst* inst = iterm->getInst();
+            if (!inst) continue;
 
-    if (!sub_inst)
-        logger_->report("Failed to create instance ", subModule_name);
-
-    reinterpret_cast<sta::ConcreteNetwork*>(sub_network)->setTopInstance(sub_inst);
-    
-    auto network_ = sta_->network();
-    for (const auto& [net, port] : sta_port_map) {
-        sta::PortDirection* dir = sub_network->direction(port);
-        if (!sub_network->direction(port)->isPowerGround()) {
-            if (dir->isAnyInput()) {
-                if (sub_network->isBus(port))
-                    std::cout << network_->fromIndex(port) << " " << network_->toIndex(port)
-                        << " " << sub_network->size(port) << std::endl;                
-                numPIs += sub_network->size(port);
-            } else {
-                if (sub_network->isBus(port))
-                    std::cout << network_->fromIndex(port) << " " << network_->toIndex(port)
-                        << " " << sub_network->size(port) << std::endl;
-                numPOs += sub_network->size(port);
+            auto* prop = odb::dbIntProperty::find(inst, "inst_id");
+            int inst_id = prop->getValue();
+            if (!inside[inst_id]) {
+                terms++;
+                break;
             }
         }
     }
-    sumT = numPIs + numPOs;
-    delete sub_network; // Clean up memory
 
-}
-
-sta::Instance* PartitionMgr::buildSubInst(const char* name,
-                                     const char* port_prefix,
-                                     sta::Library* library,
-                                     sta::NetworkReader* network,
-                                     sta::Instance* parent,
-                                     const std::set<Instance*>* insts,
-                                     std::map<Net*, Port*>* port_map)
-{
-  // build cell
-  Cell* cell = network->makeCell(library, name, false, nullptr);
-
-  // add global ports
-  auto pin_iter = db_network_->pinIterator(db_network_->topInstance());
-  while (pin_iter->hasNext()) {
-    const Pin* pin = pin_iter->next();
-
-    bool add_port = false;
-    Net* net = db_network_->net(db_network_->term(pin));
-    if (net) {
-      NetPinIterator* net_pin_iter = db_network_->pinIterator(net);
-      while (net_pin_iter->hasNext()) {
-        // check if port is connected to instance in this partition
-        if (insts->find(db_network_->instance(net_pin_iter->next()))
-            != insts->end()) {
-          add_port = true;
-          break;
-        }
-      }
-      delete net_pin_iter;
-    }
-
-    if (add_port) {
-      const char* portname = db_network_->name(pin);
-
-      Port* port = network->makePort(cell, portname);
-      // copy exactly the parent port direction
-      network->setDirection(port, db_network_->direction(pin));
-      PortDirection* sub_module_dir
-          = determinePortDirection(net, insts, db_network_);
-      if (sub_module_dir != nullptr) {
-        network->setDirection(port, sub_module_dir);
-      }
-      port_map->insert({net, port});
-    }
-  }
-  delete pin_iter;
-
-  // make internal ports for partitions and if port is not needed.
-  std::set<Net*> local_nets;
-  for (Instance* inst : *insts) {
-    InstancePinIterator* pin_iter = db_network_->pinIterator(inst);
-    while (pin_iter->hasNext()) {
-      Net* net = db_network_->net(pin_iter->next());
-      if (net != nullptr &&                          // connected
-          port_map->find(net) == port_map->end() &&  // port not present
-          local_nets.find(net) == local_nets.end()) {
-        // check if connected to anything in a different partition
-        NetPinIterator* net_pin_iter = db_network_->pinIterator(net);
-        while (net_pin_iter->hasNext()) {
-          Net* net = db_network_->net(net_pin_iter->next());
-          PortDirection* port_dir
-              = determinePortDirection(net, insts, db_network_);
-          if (port_dir == nullptr) {
-            local_nets.insert(net);
-            continue;
-          }
-          std::string port_name = port_prefix;
-          port_name += db_network_->name(net);
-
-          Port* port = network->makePort(cell, port_name.c_str());
-          network->setDirection(port, port_dir);
-
-          port_map->insert({net, port});
-          break;
-        }
-        delete net_pin_iter;
-      }
-    }
-    delete pin_iter;
-  }
-  // loop over buses and to ensure all bit ports are created, only needed for
-  // partitioned modules
-  char path_escape = db_network_->pathEscape();
-  char left_bracket;
-  char right_bracket;
-  determineLibraryBrackets(db_network_, &left_bracket, &right_bracket);
-  std::map<std::string, std::vector<Port*>> port_buses;
-  for (auto& [net, port] : *port_map) {
-      std::string portname = network->name(port);
-
-    // check if bus and get name
-    if (isBusName(portname.c_str(), left_bracket, right_bracket, path_escape)) {
-      std::string bus_name;
-      bool is_bus;
-      int idx;
-      parseBusName(portname.c_str(),
-                   left_bracket,
-                   right_bracket,
-                   path_escape,
-                   is_bus,
-                   bus_name,
-                   idx);
-
-      portname = bus_name;
-      port_buses[portname].push_back(port);
-    }
-  }
-  for (auto& [bus, ports] : port_buses) {
-    std::set<int> port_idx;
-    std::set<PortDirection*> port_dirs;
-    for (Port* port : ports) {
-      std::string bus_name;
-      bool is_bus;
-      int idx;
-      parseBusName(network->name(port),
-                   left_bracket,
-                   right_bracket,
-                   path_escape,
-                   is_bus,
-                   bus_name,
-                   idx);
-
-      port_idx.insert(idx);
-      port_dirs.insert(network->direction(port));
-    }
-
-    // determine real direction of port
-    PortDirection* overall_direction = nullptr;
-    if (port_dirs.size() == 1) {  // only one direction is used.
-      overall_direction = *port_dirs.begin();
-    } else {
-      overall_direction = PortDirection::bidirect();
-    }
-
-    // set port direction to match
-    for (Port* port : ports) {
-      network->setDirection(port, overall_direction);
-    }
-
-    // fill in missing ports in bus
-    const auto [min_idx, max_idx]
-        = std::minmax_element(port_idx.begin(), port_idx.end());
-    for (int idx = *min_idx; idx <= *max_idx; idx++) {
-      if (port_idx.find(idx) == port_idx.end()) {
-        // build missing port
-        std::string portname = bus;
-        portname += left_bracket + std::to_string(idx) + right_bracket;
-        Port* port = network->makePort(cell, portname.c_str());
-        network->setDirection(port, overall_direction);
-      }
-    }
-  }
-
-  network->groupBusPorts(cell, [](const char*) { return true; });
-
-  // build instance
-  std::string instname = name;
-  instname += "_inst";
-  Instance* inst = network->makeInstance(cell, instname.c_str(), parent);
-
-  // create nets for ports in cell
-  for (auto& [db_net, port] : *port_map) {
-    Net* net = network->makeNet(network->name(port), inst);
-    Pin* pin = network->makePin(inst, port, nullptr);
-    network->makeTerm(pin, net);
-  }
-
- // create and connect instances
-  for (Instance* instance : *insts) {
-    Instance* leaf_inst = network->makeInstance(
-        db_network_->cell(instance), db_network_->name(instance), inst);
-
-    InstancePinIterator* pin_iter = db_network_->pinIterator(instance);
-    while (pin_iter->hasNext()) {
-      Pin* pin = pin_iter->next();
-      Net* net = db_network_->net(pin);
-      if (net != nullptr) {  // connected
-        Port* port = db_network_->port(pin);
-
-        // check if connected to a port
-        auto port_find = port_map->find(net);
-        if (port_find != port_map->end()) {
-          Net* new_net
-              = network->findNet(inst, network->name(port_find->second));
-          network->connect(leaf_inst, port, new_net);
-        } else {
-          Net* new_net = network->findNet(inst, db_network_->name(net));
-          if (new_net == nullptr) {
-            new_net = network->makeNet(db_network_->name(net), inst);
-          }
-          network->connect(leaf_inst, port, new_net);
-        }
-      }
-    }
-    delete pin_iter;
-  }
-
-  return inst;
+    return terms;
 }
 
 //from RentCon
-void PartitionMgr::linCurvFit(ClusterTree& tree,
+void PartitionMgr::linCurvFit(ModuleMgr& modMgr,
                               float& Rratio,
                               float& p,
                               float& q)
 {
     
-    int n = tree.getNumModules();
+    int n = modMgr.getNumModules();
     double *x = new double[n];
     double *y = new double[n];
     
-    auto modules = tree.getModules();
-    double b = log(modules[0]->getAvgK());
+    auto modules = modMgr.getModules();
+    std::sort(modules.begin(), modules.end(), 
+            [](std::shared_ptr<Module> m1, std::shared_ptr<Module> m2) {
+        return m1->getAvgInsts() < m2->getAvgInsts();
+    });
+
+    double b = log(modules[n-1]->getAvgK());
     for (int i = 0; i < n; i++)
     {
         auto m = modules[i];
@@ -932,11 +622,8 @@ void PartitionMgr::linCurvFit(ClusterTree& tree,
     {
         auto m = modules[i];
         double numInsts = m->getAvgInsts();
-        double I = m->getInT();
-        double O = m->getOutT();
         double T = m->getAvgT();
-        double sigT = m->getSigmaT();
-        std::cout << "Level: " << i << " G: " << numInsts << " In: " << I << " Out: " << O << std::endl;
+        std::cout << "Level: " << i << " G: " << numInsts << " sumT: " << T << std::endl;
     }
 
     auto [ratio, rentP, std_dev] = fitRent(x, y, n);
@@ -1078,7 +765,6 @@ void PartitionMgr::writeFile(std::unordered_map<std::string, std::pair<int, bool
     outFile << "O " << numPOs << std::endl;
     outFile << "END" << std::endl;
     outFile.close();
-    outFile << std::endl;
     std::cout << "Dmax " << Dmax << " " << "MDmax " << MDmax << std::endl;
 }
 

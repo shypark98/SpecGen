@@ -75,146 +75,69 @@ class Module {
     double SigmaT = 0.0;
 };
 
+struct ModuleMgr {
+    std::vector<std::shared_ptr<Module>> modules;
+
+    void addModule(std::shared_ptr<Module> module) {
+        modules.push_back(module);
+    }
+
+    int getNumModules() const {
+        return modules.size();
+    }
+
+    SharedModuleVector getModules() const {
+        return modules;
+    }
+};
+
 class Cluster
 {
   public:
-    Cluster(const std::string& name) : id_(next_id_++), name_(name) {}
+    Cluster(int i) : id_(i) {}
+    ~Cluster() {
+        insts_.clear();    
+    }
 
     int getId() const
     {
         return id_; 
     }
 
-    // cluster name can be updated
-    const std::string& getName() const
+    const std::vector<odb::dbInst*> getInsts() const
     {
-        return name_;
+        return insts_;
     }
     
-    const std::vector<odb::dbInst*> getLeafInsts() const
-    {
-        return leaf_insts_;
-    }
-    
-    Cluster* getParent() const
-    {
-        return parent_;
-    }
-
-    const UniqueClusterVector& getChildren() const
-    {
-        return children_;
+    odb::dbInst* getInst(int i) {
+        if (i < insts_.size())
+            return insts_[i];
+        else {
+            std::cout << "out of index!! input: " << i 
+                << " insts_.size() " << insts_.size() << std::endl;
+            return nullptr;
+        }
     }
 
-    void setName(const std::string& name)
+    void addInst(odb::dbInst* inst)
     {
-        name_ = name; 
-    }
-    
-    void setParent(Cluster* parent)
-    {
-        parent_ = parent;
-    }
-
-    void addLeafInst(odb::dbInst* leaf_std_cell)
-    {
-        leaf_insts_.push_back(leaf_std_cell);
+        insts_.push_back(inst);
     }
 
     int getNumInsts() const
     {
-        return leaf_insts_.size();
+        return insts_.size();
     }
-    void clearLeafInsts()
-    {
-        leaf_insts_.clear();
-    }
-    
-    // Hierarchy Support
-    void addChild(std::unique_ptr<Cluster> child)
-    {
-        children_.push_back(std::move(child));
-    }
-    std::unique_ptr<Cluster> releaseChild(const Cluster* candidate)
-    {
-        auto it = std::find_if(
-        children_.begin(), children_.end(), [candidate](const auto& child) {
-            return child.get() == candidate;
-        });
 
-        if (it != children_.end()) {
-            std::unique_ptr<Cluster> released_child = std::move(*it);
-            children_.erase(it);
-            return released_child;
-        }
-
-        return nullptr;
-    }
-    void addChildren(UniqueClusterVector children)
+    void clearInsts()
     {
-        std::move(children.begin(), children.end(), std::back_inserter(children_)); 
-    }
-    UniqueClusterVector releaseChildren()
-    {
-        UniqueClusterVector released_children = std::move(children_);
-        children_.clear();
-        
-        return released_children;
+        insts_.clear();
     }
 
   private:
-    int id_ = -1; // cluster id (a valid cluster id should be nonnegative)
-    std::string name_;
-    std::vector<odb::dbInst*> leaf_insts_;
-    Cluster* parent_ = nullptr;  // parent of current cluster
+    int id_ = -1;
+    std::vector<odb::dbInst*> insts_;
     static int next_id_;
-    UniqueClusterVector children_; 
 };
-
-class ClusterTree
-{
-  public:
-    struct Maps {
-        std::map<int, Cluster*> id_to_cluster;
-        std::map<odb::dbInst*, int> inst_to_cluster_id;
-        std::map<odb::dbBTerm*, int> bterm_to_cluster_id;
-    };
-
-    Maps maps;
-    int large_net_threshold = 50; //same with RTLMP
-    
-    ClusterTree(odb::dbBlock* block) {
-        root_ = std::make_unique<Cluster>("__cluster__");
-        maps.id_to_cluster[root_->getId()] = root_.get();
-
-        for (const auto inst : block->getInsts()) {
-            root_->addLeafInst(inst);
-            maps.inst_to_cluster_id[inst] = root_->getId();
-        }
-        for (const auto bterm : block->getBTerms()) {
-            maps.bterm_to_cluster_id[bterm] = root_->getId();
-        }
-    }
-    
-    Cluster* getRoot() const { return root_.get(); }
-    
-    void registerCluster(Cluster* cluster) {
-        maps.id_to_cluster[cluster->getId()] = cluster;
-    }
-    
-    void addModule(std::shared_ptr<Module> module) 
-    {
-        modules_.push_back(module);
-    }
-    
-    int getNumModules() const { return modules_.size(); }
-    
-    SharedModuleVector getModules() const { return modules_; }
-
-private:
-    std::unique_ptr<Cluster> root_; 
-    SharedModuleVector modules_;
-};
-  
 
 } //namespace
